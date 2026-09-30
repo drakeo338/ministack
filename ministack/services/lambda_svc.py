@@ -341,6 +341,7 @@ _RESERVED_RUNTIME_ENV_VARS = {
     "AWS_SESSION_TOKEN",
     "AWS_LAMBDA_FUNCTION_NAME",
     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_TIMEOUT",
     "AWS_LAMBDA_FUNCTION_VERSION",
     "AWS_LAMBDA_LOG_STREAM_NAME",
     "AWS_LAMBDA_RUNTIME_API",
@@ -1556,6 +1557,30 @@ def _snapstart_provision_version_async(name: str, ver_record: dict) -> None:
     ).start()
 
 
+def _vpc_config_with_id(request_config: dict | None) -> dict:
+    """Add Lambda's read-only VpcId from the configured EC2 subnets."""
+    config = copy.deepcopy(request_config) if request_config is not None else {
+        "SubnetIds": [], "SecurityGroupIds": [],
+    }
+    subnet_ids = config.get("SubnetIds") or []
+    vpc_ids = set()
+    all_found = True
+    if subnet_ids:
+        from ministack.services import ec2
+
+        ec2._ensure_defaults_initialized()
+        for subnet_id in subnet_ids:
+            subnet = ec2._subnets.get(subnet_id)
+            if subnet is None:
+                all_found = False
+                break
+            vpc_ids.add(subnet["VpcId"])
+    # An unknown or mixed-VPC subnet set must not claim a VPC. AWS validates
+    # these inputs; MiniStack currently accepts them, so leave VpcId empty.
+    config["VpcId"] = vpc_ids.pop() if all_found and len(vpc_ids) == 1 else ""
+    return config
+
+
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
     code_size = len(code_zip) if code_zip else 0
     code_sha = base64.b64encode(hashlib.sha256(code_zip).digest()).decode() if code_zip else ""
@@ -1603,14 +1628,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "Architectures": data.get("Architectures", ["x86_64"]),
         "Layers": layers_cfg,
         "TracingConfig": data.get("TracingConfig", {"Mode": "PassThrough"}),
-        "VpcConfig": data.get(
-            "VpcConfig",
-            {
-                "SubnetIds": [],
-                "SecurityGroupIds": [],
-                "VpcId": "",
-            },
-        ),
+        "VpcConfig": _vpc_config_with_id(data.get("VpcConfig")),
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
@@ -2877,6 +2895,8 @@ def _update_config(name: str, data: dict):
                 # Request carries only ApplyOn; the stored/echoed shape adds
                 # OptimizationStatus, which is always Off on $LATEST.
                 config["SnapStart"] = _snapstart_response(data["SnapStart"])
+            elif key == "VpcConfig":
+                config[key] = _vpc_config_with_id(data[key])
             else:
                 config[key] = data[key]
     if "Architectures" in data:
@@ -2892,7 +2912,7 @@ def _update_config(name: str, data: dict):
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
     # AWS-match: UpdateFunctionConfiguration recycles the init container when
-    # spawn-time inputs change (Runtime/Handler/Layers/Env/MemorySize/Arch/
+    # spawn-time inputs change (Runtime/Handler/Timeout/Layers/Env/MemorySize/Arch/
     # VpcConfig/FileSystemConfigs). The ministack warm-pool key is just
     # account:func:qualifier, so a stale worker would keep serving with the
     # pre-update layers/env. Invalidate to force a fresh worker on next invoke,
@@ -2900,7 +2920,7 @@ def _update_config(name: str, data: dict):
     # UpdateFunctionConfiguration(Layers=[...]) leaves the previously-warm
     # worker without the new layer extracted on disk (issue #816).
     _WORKER_AFFECTING = {
-        "Runtime", "Handler", "Layers", "Environment", "MemorySize",
+        "Runtime", "Handler", "Timeout", "Layers", "Environment", "MemorySize",
         "Architectures", "VpcConfig", "FileSystemConfigs",
     }
     if any(k in data for k in _WORKER_AFFECTING):
@@ -4395,6 +4415,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
+        # AWS RIE uses this name and otherwise limits invocations to 300s.
+        "AWS_LAMBDA_FUNCTION_TIMEOUT": str(timeout),
     }
     container_env.update(execution_credentials(config))
     if is_provided:
