@@ -68,11 +68,13 @@ logger = logging.getLogger("cloudformation")
 # so AWS::Region / ARNs reflect the caller's request region (#398).
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+# Mixed into generated names; a replacement draws a new one, kept on the resource record.
+_NAME_SEED = contextvars.ContextVar("cfn_name_seed", default="")
 
 
 def _physical_name(stack_name: str, logical_id: str, *,
                    lowercase: bool = False, max_len: int = 128,
-                   replacing: str = "") -> str:
+                   seeded: bool = True) -> str:
     """Generate an AWS-style physical resource name: {stack}-{logicalId}-{SUFFIX}.
 
     Matches the pattern AWS CloudFormation uses for auto-named resources so that
@@ -91,10 +93,8 @@ def _physical_name(stack_name: str, logical_id: str, *,
     update silently produced a brand new, empty resource under a new name,
     orphaning the real one — and anything referencing it via Ref/Fn::GetAtt
     picked up that new (wrong) identity the moment it was reprocessed later in
-    the same update. Resource *replacement* (a property change real AWS can't
-    apply in place) is not detected here: a handler that replaces passes
-    ``replacing`` (the predecessor's physical id), so the replacement gets a
-    name of its own.
+    the same update. A replacement changes the suffix through ``_NAME_SEED``,
+    unless ``seeded`` is false.
 
     Truncates the `{stack}-{logicalId}-` prefix, never the suffix: a naive
     `base[:max_len]` on the full concatenated string drops whatever falls past
@@ -111,8 +111,9 @@ def _physical_name(stack_name: str, logical_id: str, *,
     cut, since the suffix alone (hashed from stack_name *and* logical_id) is
     what actually guarantees uniqueness here.
     """
-    seed = f"{stack_name}:{logical_id}" + (f":{replacing}" if replacing else "")
-    suffix = hashlib.sha256(seed.encode()).hexdigest()[:13].upper()
+    seed = _NAME_SEED.get() if seeded else ""
+    key = f"{stack_name}:{logical_id}:{seed}" if seed else f"{stack_name}:{logical_id}"
+    suffix = hashlib.sha256(key.encode()).hexdigest()[:13].upper()
     prefix = f"{stack_name}-{logical_id}-"
     available = max(max_len - len(suffix), 0)
     base = prefix[:available] + suffix
@@ -539,6 +540,11 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
     raise ValueError(f"Unsupported resource type: {resource_type}")
 
 
+def _import_resource(resource_type: str, identifier: dict) -> tuple:
+    """Adopt an existing resource by its ResourceIdentifier. Returns (physical_id, attributes)."""
+    return _RESOURCE_HANDLERS[resource_type]["import"](identifier)
+
+
 def _snapshot_id(physical_id: str) -> str:
     """Name for a `DeletionPolicy: Snapshot` snapshot. AWS generates one too;
     its format is not documented, so this is the emulator's."""
@@ -657,6 +663,7 @@ def _requires_replacement_pipes(old_props, new_props):
 # custom-named resource (you must rename it first), so MiniStack must fail the
 # update instead of silently executing the replacement and destroying data
 # (issue #1433).
+# An ``exists`` entry is not refused up front: the replacement's create fails on the name.
 _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
         "name": "TableName",
@@ -723,12 +730,27 @@ _CUSTOM_NAME_REPLACEMENT = {
         "name": "InstanceProfileName",
         "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
+    "AWS::IAM::Role": {"name": "RoleName"},
+    "AWS::IAM::ManagedPolicy": {
+        "name": "ManagedPolicyName",
+        "exists": "A policy called {name} already exists. Duplicate names are not allowed.",
+    },
+    "AWS::ECR::Repository": {"name": "RepositoryName"},
     "AWS::IoT::ProvisioningTemplate": {
         "name": "TemplateName",
         "requires_replacement": lambda old, new: (
             old.get("TemplateType", "FLEET_PROVISIONING")
             != new.get("TemplateType", "FLEET_PROVISIONING")
         ),
+    },
+    "AWS::Lambda::Function": {"name": "FunctionName"},
+    "AWS::SQS::Queue": {
+        "name": "QueueName",
+        "exists": "Queue creation failed because the queue already exists",
+    },
+    "AWS::SNS::Topic": {
+        "name": "TopicName",
+        "exists": "Topic creation failed because the topic already exists",
     },
     # "If you specify a name, you cannot perform updates that require
     # replacement of this resource, but you can perform other updates"
@@ -806,7 +828,8 @@ _CUSTOM_NAME_REPLACEMENT = {
 }
 
 
-def _custom_named_replacement_error(resource_type, old_props, new_props):
+def _custom_named_replacement_error(resource_type, old_props, new_props,
+                                    physical_id=None):
     """Return the real-AWS error when a stack update would replace a
     custom-named resource, else None.
 
@@ -814,29 +837,30 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
     sanctioned escape hatch (the replacement proceeds under the new name), and
     an auto-generated name can always be replaced.
     """
-    spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
-    if not spec:
+    name = _kept_custom_name(resource_type, old_props, new_props)
+    if not name or "exists" in _CUSTOM_NAME_REPLACEMENT[resource_type]:
         return None
-    old_name = old_props.get(spec["name"])
-    new_name = new_props.get(spec["name"])
-    if not old_name or old_name != new_name:
-        return None
-    if spec["requires_replacement"](old_props, new_props):
+    if _requires_replacement(resource_type, old_props, new_props):
         return (
             "CloudFormation cannot update a stack when a custom-named resource "
-            f"requires replacing. Rename {old_name} and update the stack again."
+            f"requires replacing. Rename {physical_id or name} and update "
+            "the stack again."
         )
     return None
 
 
-def _requires_replacement(resource_type, old_props, new_props):
-    """Whether a replacing property of the type changed, read from the table
-    ``_custom_named_replacement_error`` reads. An explicit physical name
-    refuses that replacement above the handler; under a generated name there
-    is nothing to refuse and the handler performs it, so both answers come
-    from one definition."""
+def _kept_custom_name(resource_type, old_props, new_props):
+    """The explicit name an update keeps unchanged, else None."""
     spec = _CUSTOM_NAME_REPLACEMENT.get(resource_type)
-    return bool(spec and spec["requires_replacement"](old_props, new_props))
+    name = old_props.get(spec["name"]) if spec else None
+    return name if name and name == new_props.get(spec["name"]) else None
+
+
+def _requires_replacement(resource_type, old_props, new_props):
+    """Whether a create-only property or an entry's extra predicate changed."""
+    extra = _CUSTOM_NAME_REPLACEMENT.get(resource_type, {}).get("requires_replacement")
+    return (_replacing_change(resource_type, old_props, new_props)
+            or bool(extra and extra(old_props, new_props)))
 
 
 # Set by the stack engine around an update whose resource carries
@@ -892,13 +916,7 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     retaining set): the engine then records the DELETE_SKIPPED event and the
     predecessor stays, as on AWS. Every update handler that creates the
     replacement itself removes the old resource through this, so the policy
-    cannot be forgotten at one site, with these exceptions. The DynamoDB
-    table, the Location tracker, the IoT thing type, the Glue trigger and the
-    RDS DB cluster and instance have a deterministic generated name: the
-    replacement takes the name back, so there is nothing left to retain. The
-    other is the Lambda permission's degenerate ``Id`` branch, which removes
-    and re-puts one statement under a Sid that cannot change: the physical id
-    is kept, nothing is replaced, and the policy does not apply.
+    cannot be forgotten at one site.
     """
     if _RETAIN_REPLACED.get():
         return
@@ -909,16 +927,27 @@ def _delete_predecessor(delete_fn, *args, **kwargs):
     delete_fn(*args, **kwargs)
 
 
-def _replacing_update(create_fn, delete_fn):
-    """An update handler for a type whose every property is create-only."""
-    def update(physical_id, old_props, new_props, stack_name, logical_id=None):
-        # An unchanged custom name was refused above the handler; a generated
-        # name gets a new one, so the predecessor survives until cleanup.
-        created = create_fn(logical_id or physical_id, new_props, stack_name,
-                            replacing=physical_id)
-        _delete_predecessor(delete_fn, physical_id, old_props)
-        return created
-    return update
+def _seeded_create(create_fn, logical_id, props, stack_name):
+    """Create a handler's replacement under a new generated name."""
+    _NAME_SEED.set(new_uuid()[:8])
+    return create_fn(logical_id, props, stack_name)
+
+
+def _replace_resource(resource_type, physical_id, old_props, new_props,
+                      stack_name, logical_id):
+    """Create the resource anew under a new generated name."""
+    name = _kept_custom_name(resource_type, old_props, new_props)
+    if name:
+        raise ValueError(_CUSTOM_NAME_REPLACEMENT[resource_type]["exists"].format(name=name))
+    # Not reset: the caller keeps the seed on the resource record.
+    _NAME_SEED.set(new_uuid()[:8])
+    created = _provision_resource(resource_type, logical_id or physical_id,
+                                  new_props, stack_name)
+    # A stack deletes the predecessor in its cleanup phase; a nested stack has none.
+    if created[0] != physical_id and _DEFERRED_PREDECESSOR_DELETES.get() is None:
+        _delete_predecessor(_delete_resource, resource_type, physical_id,
+                            old_props, stack_name, logical_id)
+    return created
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
@@ -958,10 +987,13 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
                          resource_type, physical_id)
             return physical_id, old_attrs or {}
     replacement_error = _custom_named_replacement_error(
-        resource_type, old_props, new_props
+        resource_type, old_props, new_props, physical_id
     )
     if replacement_error:
         raise ValueError(replacement_error)
+    if _replacing_change(resource_type, old_props, new_props):
+        return _replace_resource(resource_type, physical_id, old_props,
+                                 new_props, stack_name, logical_id)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
             return handler["update"](
@@ -1320,7 +1352,7 @@ def _s3_apply_notification(name, notif):
 # S3 Multi-Region Access Point
 # ---------------------------------------------------------------------------
 
-def _s3_mrap_create(logical_id, props, stack_name, replacing=""):
+def _s3_mrap_create(logical_id, props, stack_name):
     """Provision an AWS::S3::MultiRegionAccessPoint.
 
     On AWS this is asynchronous — `CreateMultiRegionAccessPoint` returns a
@@ -1332,7 +1364,7 @@ def _s3_mrap_create(logical_id, props, stack_name, replacing=""):
     plane can resolve the alias to one of them.
     """
     name = props.get("Name") or _physical_name(
-        stack_name, logical_id, lowercase=True, max_len=50, replacing=replacing)
+        stack_name, logical_id, lowercase=True, max_len=50)
     buckets = [
         r.get("Bucket") for r in (props.get("Regions") or [])
         if isinstance(r, dict) and r.get("Bucket")
@@ -1365,6 +1397,15 @@ def _s3_mrap_delete(physical_id, props):
             _s3._mraps.pop(alias, None)
 
 
+def _s3_attrs(name):
+    return {
+        "Arn": f"arn:aws:s3:::{name}",
+        "DomainName": f"{name}.s3.amazonaws.com",
+        "RegionalDomainName": f"{name}.s3.{get_region()}.amazonaws.com",
+        "WebsiteURL": f"http://{name}.s3-website-{get_region()}.amazonaws.com",
+    }
+
+
 def _s3_create(logical_id, props, stack_name):
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     _s3._buckets.setdefault(name, {
@@ -1377,13 +1418,7 @@ def _s3_create(logical_id, props, stack_name):
         _s3._bucket_versioning[name] = "Enabled"
     if "NotificationConfiguration" in props:
         _s3_apply_notification(name, props["NotificationConfiguration"])
-    attrs = {
-        "Arn": f"arn:aws:s3:::{name}",
-        "DomainName": f"{name}.s3.amazonaws.com",
-        "RegionalDomainName": f"{name}.s3.{get_region()}.amazonaws.com",
-        "WebsiteURL": f"http://{name}.s3-website-{get_region()}.amazonaws.com",
-    }
-    return name, attrs
+    return name, _s3_attrs(name)
 
 
 def _s3_update(physical_id, old_props, new_props, stack_name):
@@ -1408,13 +1443,7 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
             _s3._bucket_notifications.pop(name, None)
     else:
         return _s3_create(name, new_props, stack_name)
-    attrs = {
-        "Arn": f"arn:aws:s3:::{name}",
-        "DomainName": f"{name}.s3.amazonaws.com",
-        "RegionalDomainName": f"{name}.s3.{get_region()}.amazonaws.com",
-        "WebsiteURL": f"http://{name}.s3-website-{get_region()}.amazonaws.com",
-    }
-    return name, attrs
+    return name, _s3_attrs(name)
 
 
 def _s3_bucket_policy_create(logical_id, props, stack_name):
@@ -1437,6 +1466,10 @@ def _s3_bucket_policy_update(physical_id, old_props, new_props, stack_name):
 def _s3_bucket_policy_delete(physical_id, props):
     bucket = props.get("Bucket", "")
     _s3._bucket_policies.pop(bucket, None)
+
+
+def _s3_import(identifier):
+    return identifier["BucketName"], _s3_attrs(identifier["BucketName"])
 
 
 def _s3_delete(physical_id, props):
@@ -1523,7 +1556,12 @@ def _sqs_create(logical_id, props, stack_name):
     }
     _sqs._queues[url] = queue
     _sqs._queue_name_to_url[name] = url
-    return url, {"Arn": arn, "QueueName": name, "QueueUrl": url}
+    return url, _sqs_attrs(queue)
+
+
+def _sqs_attrs(queue):
+    return {"Arn": queue["attributes"]["QueueArn"], "QueueName": queue["name"],
+            "QueueUrl": queue["url"]}
 
 
 def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -1550,8 +1588,12 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     attributes.update(fields)
     _reconcile_tag_map(queue.setdefault("tags", {}), old_props, new_props)
     attributes["LastModifiedTimestamp"] = str(int(time.time()))
-    arn = attributes["QueueArn"]
-    return physical_id, {"Arn": arn, "QueueName": name, "QueueUrl": physical_id}
+    return physical_id, _sqs_attrs(queue)
+
+
+def _sqs_import(identifier):
+    queue = _sqs._get_q(identifier["QueueUrl"])
+    return queue["url"], _sqs_attrs(queue)
 
 
 def _sqs_delete(physical_id, props):
@@ -1624,7 +1666,11 @@ def _sns_create(logical_id, props, stack_name):
         _sns._topics[arn]["subscriptions"].append(sub)
         _sns._sub_arn_to_topic[sub_arn] = arn
 
-    return arn, {"TopicArn": arn, "TopicName": name}
+    return arn, _sns_topic_attrs(arn)
+
+
+def _sns_topic_attrs(arn):
+    return {"TopicArn": arn, "TopicName": arn.rsplit(":", 1)[-1]}
 
 
 def _sns_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -1673,7 +1719,11 @@ def _sns_update(physical_id, old_props, new_props, stack_name, logical_id=None):
         }
         topic["subscriptions"].append(sub)
         _sns._sub_arn_to_topic[sub_arn] = physical_id
-    return physical_id, {"TopicArn": physical_id, "TopicName": name}
+    return physical_id, _sns_topic_attrs(physical_id)
+
+
+def _sns_import(identifier):
+    return identifier["TopicArn"], _sns_topic_attrs(identifier["TopicArn"])
 
 
 def _sns_delete(physical_id, props):
@@ -1905,9 +1955,7 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
         # Not routed through _delete_predecessor: the emulator's generated
         # name is deterministic, so the table comes back under the same name
         # and the old one is lost even under UpdateReplacePolicy Retain (AWS
-        # would mint a new name and keep the old table). AWS::Location::Tracker
-        # is the other type with that shape and is left alone for the same
-        # reason.
+        # would mint a new name and keep the old table).
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
 
@@ -1963,10 +2011,19 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             "GlobalSecondaryIndexUpdates": [{"Create": new_gsis[idx_name]}],
         })
 
+    return name, _ddb_attrs(table)
+
+
+def _ddb_attrs(table):
     attrs = {"Arn": table["TableArn"]}
     if table.get("LatestStreamArn") and (table.get("StreamSpecification") or {}).get("StreamEnabled"):
         attrs["StreamArn"] = table["LatestStreamArn"]
-    return name, attrs
+    return attrs
+
+
+def _ddb_import(identifier):
+    name = identifier["TableName"]
+    return name, _ddb_attrs(_dynamodb._tables[name])
 
 
 def _ddb_global_table_create(logical_id, props, stack_name):
@@ -2139,10 +2196,8 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     published versions, aliases, the resource policy, tags, event invoke
     configs. Going through the Lambda module's own update paths keeps them.
 
-    FunctionName is create-only (a change is a replacement, executed here as
-    create-new-then-delete-old); a PackageType flip is also a replacement on
-    AWS, but under the same deterministic physical name the closest local
-    equivalent is the full re-provision the create fallback always did.
+    FunctionName, PackageType and TenancyConfig are replaced in ``_update_resource``;
+    a DurableConfig change re-provisions under the same name.
     """
     name = new_props.get("FunctionName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
@@ -2158,12 +2213,8 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     code = new_props.get("Code", {})
     image_uri = code.get("ImageUri")
     is_image = new_props.get("PackageType") == "Image" or bool(image_uri)
-    # DurableConfig and TenancyConfig are "Update requires: Replacement" in the
-    # resource reference, like a PackageType flip: same local equivalent.
-    replacing = is_image != (func["config"].get("PackageType") == "Image") or any(
-        old_props.get(p) != new_props.get(p)
-        for p in ("DurableConfig", "TenancyConfig")
-    )
+    replacing = (is_image != (func["config"].get("PackageType") == "Image")
+                 or old_props.get("DurableConfig") != new_props.get("DurableConfig"))
     if replacing:
         # The re-provision replaces the whole function record under the same
         # name — a stale warm worker or pooled container would keep serving
@@ -2223,6 +2274,11 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
     _reconcile_tag_map(func.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": func["config"]["FunctionArn"]}
+
+
+def _lambda_import(identifier):
+    name = identifier["FunctionName"]
+    return name, {"Arn": _lambda_svc._functions[name]["config"]["FunctionArn"]}
 
 
 def _lambda_delete(physical_id, props):
@@ -2299,7 +2355,7 @@ def _lambda_url_delete(physical_id, props):
 
 def _iam_role_create(logical_id, props, stack_name):
     name = props.get("RoleName") or _physical_name(stack_name, logical_id, max_len=64)
-    arn = f"arn:aws:iam::{get_account_id()}:role/{name}"
+    arn = f"arn:aws:iam::{get_account_id()}:role{props.get('Path', '/')}{name}"
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
     assume_doc = props.get("AssumeRolePolicyDocument", {})
     if isinstance(assume_doc, dict):
@@ -2348,12 +2404,8 @@ def _iam_role_create(logical_id, props, stack_name):
 def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a role in place, keeping its ARN and RoleId.
 
-    RoleName is create-only (a change replaces the role; AWS sanctions the
-    rename); Path also requires replacement, which AWS refuses for an
-    explicitly-named role. Everything else — assume-role document, inline
-    Policies, ManagedPolicyArns, Description, MaxSessionDuration, Tags —
-    updates in place, so policies attached from outside the template survive
-    (the create fallback used to rebuild the record and drop them).
+    RoleName and Path are replaced in ``_update_resource``; the rest updates
+    in place, so policies attached from outside the template survive.
     """
     name = new_props.get("RoleName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=64
@@ -2366,15 +2418,6 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
     )
     if replaced is not None:
         return replaced
-
-    if new_props.get("Path", "/") != old_props.get("Path", "/"):
-        if old_props.get("RoleName"):
-            raise ValueError(
-                "CloudFormation cannot update a stack when a custom-named "
-                f"resource requires replacing. Rename {name} and update the "
-                "stack again."
-            )
-        return _iam_role_create(logical_id or physical_id, new_props, stack_name)
 
     assume_doc = new_props.get("AssumeRolePolicyDocument", {})
     if isinstance(assume_doc, dict):
@@ -2406,6 +2449,12 @@ def _iam_role_update(physical_id, old_props, new_props, stack_name, logical_id=N
         {"Key": t.get("Key", ""), "Value": t.get("Value", "")}
         for t in new_props.get("Tags", [])
     ]
+    return name, {"Arn": role["Arn"], "RoleId": role["RoleId"]}
+
+
+def _iam_role_import(identifier):
+    name = identifier["RoleName"]
+    role = _iam._roles[name]
     return name, {"Arn": role["Arn"], "RoleId": role["RoleId"]}
 
 
@@ -2648,11 +2697,7 @@ def _iam_ip_roles(props):
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    # A generated name is the emulator's deterministic one, so a replacement
-    # lands under the same name (AWS would mint a new one) and must not be
-    # refused; a custom name goes through CreateInstanceProfile as it is, and
-    # its EntityAlreadyExists keeps one stack from writing over a profile
-    # another stack or the API owns.
+    # A generated name is this stack's to take over; a custom one meets EntityAlreadyExists.
     if not props.get("InstanceProfileName"):
         _iam._instance_profiles.pop(name, None)
     resp = _iam._create_instance_profile({"InstanceProfileName": [name], "Path": [path]})
@@ -2783,6 +2828,11 @@ def _ssm_update(physical_id, old_props, new_props, stack_name):
         _ssm._tags.setdefault(_ssm._param_arn(physical_id), {}), old_props, new_props
     )
     return physical_id, _ssm_attrs(physical_id, data)
+
+
+def _ssm_import(identifier):
+    name = identifier["Name"]
+    return name, _ssm_attrs(name, _ssm._lookup_parameter(name)[1])
 
 
 def _ssm_delete(physical_id, props):
@@ -3179,6 +3229,11 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     group["kmsKeyId"] = new_props.get("KmsKeyId") or None
     _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": group["arn"]}
+
+
+def _cwlogs_import(identifier):
+    name = identifier["LogGroupName"]
+    return name, {"Arn": _cw_logs._log_groups[name]["arn"]}
 
 
 def _cwlogs_delete(physical_id, props):
@@ -3615,16 +3670,14 @@ def _eks_cluster_update(physical_id, old_props, new_props, stack_name, logical_i
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::EKS::Cluster", old_props, new_props):
-        raise ValueError(
-            f"AWS::EKS::Cluster {name} requires replacement, which MiniStack does not "
-            "perform under a generated name; set a Name to create the replacement."
-        )
+        created = _seeded_create(_eks_cluster_create, logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_eks_cluster_delete, physical_id, old_props)
+        return created
     fields = _eks_cluster_fields(new_props)
     if "Logging" not in new_props:
         # A rollback to a template without Logging leaves the logging as it is.
         del fields["logging"]
-    # A template without the endpoint access members or AuthenticationMode
-    # leaves them as they are, as with Logging; dropped SecurityGroupIds go.
+    # Omitted endpoint access and AuthenticationMode stay; dropped SecurityGroupIds go.
     cluster["resourcesVpcConfig"].update({"securityGroupIds": [], **fields.pop("resourcesVpcConfig")})
     cluster.setdefault("accessConfig", {}).update(fields.pop("accessConfig"))
     cluster.update(fields)
@@ -3661,7 +3714,8 @@ def _eks_nodegroup_attrs(ng):
 def _eks_nodegroup_create(logical_id, props, stack_name):
     import ministack.services.eks as _eks
     cluster_name = props.get("ClusterName", "")
-    ng_name = props.get("NodegroupName") or _physical_name(stack_name, logical_id, max_len=63)
+    ng_name = props.get("NodegroupName") or _physical_name(
+        stack_name, logical_id, max_len=63)
     body = {
         "nodegroupName": ng_name,
         "instanceTypes": props.get("InstanceTypes", ["t3.medium"]),
@@ -3698,10 +3752,10 @@ def _eks_nodegroup_update(physical_id, old_props, new_props, stack_name, logical
             "NodeRole", "Subnets", "InstanceTypes", "AmiType", "CapacityType", "DiskSize",
             "RemoteAccess")):
         if not new_props.get("NodegroupName"):
-            raise ValueError(
-                f"AWS::EKS::Nodegroup {ng_name} requires replacement, which MiniStack does not "
-                "perform under a generated name; set a NodegroupName to create the replacement."
-            )
+            created = _seeded_create(
+                _eks_nodegroup_create, logical_id or physical_id, new_props, stack_name)
+            _delete_predecessor(_eks_nodegroup_delete, physical_id, old_props)
+            return created
         # The replacement's create meets the name still in use and fails, as on AWS.
         return _eks_nodegroup_create(logical_id or physical_id, new_props, stack_name)
     fields = _eks_nodegroup_fields(new_props)
@@ -4067,7 +4121,7 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
     using-cfn-nested-stacks), so the set the parent stored covers the child
     and, through the child's own record, every level below it. Like the
-    parent's check it runs under AUTH=true or CFN_ENFORCE_CAPABILITIES=1. A
+    parent's check it runs under AUTH=true only. A
     child template with a macro needs CAPABILITY_AUTO_EXPAND on the parent.
     """
     from ministack.services.cloudformation.handlers import (
@@ -4151,6 +4205,9 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
+        if any(isinstance(v, list) for v in raw_param_props.values()):
+            # AWS fails a list here, for example a Ref to a CommaDelimitedList
+            raise ValueError("Value of property Parameters must be an object with String (or simple type) properties")
         provided_params = [
             {"Key": k, "Value": "" if v is None else str(v)}
             for k, v in raw_param_props.items()
@@ -4252,6 +4309,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
 
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
                    f"{status_prefix}_IN_PROGRESS")
+        name_seed = ""
         try:
             prev = prev_resources.get(child_logical_id)
             new_tagged = _with_stack_tags(
@@ -4272,12 +4330,15 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                 # The child has no cleanup phase of its own: its handlers
                 # delete the predecessor at once, not into the parent's queue.
                 deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(None)
+                seed_token = _NAME_SEED.set(prev.get("_name_seed", ""))
                 try:
                     physical_id, attrs = _update_resource(
                         resource_type, prev.get("PhysicalResourceId", child_logical_id),
                         old_tagged, new_tagged, child_name, child_logical_id,
                     )
+                    name_seed = _NAME_SEED.get()
                 finally:
+                    _NAME_SEED.reset(seed_token)
                     _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
             else:
@@ -4302,6 +4363,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             "Attributes": attrs,
             "Timestamp": now_iso(),
         }
+        if name_seed:
+            provisioned[child_logical_id]["_name_seed"] = name_seed
         _add_event(child_stack_id, child_name, child_logical_id, resource_type,
                    f"{status_prefix}_COMPLETE", physical_id=physical_id)
 
@@ -4520,13 +4583,13 @@ def _apigw_rest_api_create(logical_id, props, stack_name):
         api = json.loads(body) if isinstance(body, bytes) else json.loads(body)
         api_id = api.get("id", "")
 
-    # Find root resource id
-    root_id = ""
-    for rid, res in _apigw_v1._resources.get(api_id, {}).items():
-        if res.get("path") == "/":
-            root_id = rid
-            break
-    return api_id, {
+    return api_id, _apigw_rest_api_attrs(api_id)
+
+
+def _apigw_rest_api_attrs(api_id):
+    root_id = next((rid for rid, res in _apigw_v1._resources.get(api_id, {}).items()
+                    if res.get("path") == "/"), "")
+    return {
         "RestApiId": api_id,
         "RootResourceId": root_id,
         "Arn": f"arn:aws:apigateway:{get_region()}::/restapis/{api_id}",
@@ -4574,17 +4637,11 @@ def _apigw_rest_api_update(physical_id, old_props, new_props, stack_name, logica
         api = _apigw_v1._rest_apis.get(physical_id)
         if api is not None:
             api["tags"] = {t["Key"]: t["Value"] for t in new_props.get("Tags", [])}
+    return physical_id, _apigw_rest_api_attrs(physical_id)
 
-    root_id = ""
-    for rid, res in _apigw_v1._resources.get(physical_id, {}).items():
-        if res.get("path") == "/":
-            root_id = rid
-            break
-    return physical_id, {
-        "RestApiId": physical_id,
-        "RootResourceId": root_id,
-        "Arn": f"arn:aws:apigateway:{get_region()}::/restapis/{physical_id}",
-    }
+
+def _apigw_rest_api_import(identifier):
+    return identifier["RestApiId"], _apigw_rest_api_attrs(identifier["RestApiId"])
 
 
 def _apigw_rest_api_delete(physical_id, props):
@@ -5027,6 +5084,10 @@ def _apigw_stage_update(physical_id, old_props, new_props, stack_name):
         if stage is not None:
             stage["tags"] = {t["Key"]: t["Value"] for t in new_props.get("Tags", [])}
     return stage_name, {"StageName": stage_name}
+
+
+def _apigw_stage_import(identifier):
+    return identifier["StageName"], {"StageName": identifier["StageName"]}
 
 
 def _apigw_stage_delete(physical_id, props):
@@ -5714,10 +5775,9 @@ def _pipes_pipe_update(physical_id, old_props, new_props, stack_name, logical_id
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::Pipes::Pipe", old_props, new_props):
-        # Not routed through _delete_predecessor, like the Location tracker:
-        # the generated name is deterministic, so register_pipe overwrites the
-        # predecessor and retaining it is not possible here.
-        return _pipes_pipe_create(logical_id or physical_id, new_props, stack_name)
+        created = _seeded_create(_pipes_pipe_create, logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_pipes_pipe_delete, physical_id, old_props)
+        return created
     fields = _pipes_pipe_fields(new_props)
     _pipes.check_same_region(fields["Target"])
     status, _headers, body = _pipes._update_pipe(physical_id, fields)
@@ -6493,6 +6553,11 @@ def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
     return physical_id, _cognito_user_pool_attributes(physical_id)
 
 
+def _cognito_user_pool_import(identifier):
+    pool_id = identifier["UserPoolId"]
+    return pool_id, _cognito_user_pool_attributes(pool_id)
+
+
 def _cognito_user_pool_delete(physical_id, props):
     pool = _cognito._user_pools.pop(physical_id, None)
     if pool and pool.get("Domain"):
@@ -6595,6 +6660,11 @@ def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_na
     return physical_id, _cognito_user_pool_client_attributes(client)
 
 
+def _cognito_user_pool_client_import(identifier):
+    client = _cognito._user_pools[identifier["UserPoolId"]]["_clients"][identifier["ClientId"]]
+    return client["ClientId"], _cognito_user_pool_client_attributes(client)
+
+
 def _cognito_user_pool_client_delete(physical_id, props):
     pid = props.get("UserPoolId", "")
     pool = _cognito._user_pools.get(pid)
@@ -6671,6 +6741,10 @@ def _cognito_user_pool_resource_server_update(physical_id, old_props, new_props,
     return identifier, {}
 
 
+def _cognito_user_pool_resource_server_import(identifier):
+    return identifier["Identifier"], {}
+
+
 def _cognito_user_pool_resource_server_delete(physical_id, props):
     pid = props.get("UserPoolId", "")
     pool = _cognito._user_pools.get(pid)
@@ -6710,36 +6784,15 @@ def _cognito_user_pool_group_create(logical_id, props, stack_name):
 def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_name,
                                     logical_id=None):
     """Update a group in place, keeping its name (what Ref returns) and its
-    members. GroupName and UserPoolId require replacement
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html):
-    a rename, or a move to another pool, creates the new group before the
-    old one is removed; a move that keeps an explicit GroupName was already
-    refused by _custom_named_replacement_error, the way CloudFormation
-    refuses to replace a custom-named resource. Description, Precedence and
+    members. GroupName and UserPoolId changes are replaced in
+    ``_update_resource`` before this runs. Description, Precedence and
     RoleArn are what UpdateGroup takes, applied to the record directly since
     the service has no UpdateGroup handler.
-
-    The replacement prologue is spelled out here rather than going through
-    _rename_replacement because a group is keyed by (pool, name), and the
-    helper only compares names: a move to another pool under a generated
-    name keeps the same name, so the helper would see no replacement and
-    the old group would stay stranded in the old pool. The pool has to be
-    part of the replacement test.
     """
-    name = new_props.get("GroupName") or _physical_name(
-        stack_name, logical_id or physical_id, max_len=128
-    )
-    old_pid = old_props.get("UserPoolId", "")
-    new_pid = new_props.get("UserPoolId", "")
-    pool = _cognito._user_pools.get(old_pid)
+    pool = _cognito._user_pools.get(new_props.get("UserPoolId", ""))
     group = pool["_groups"].get(physical_id) if pool else None
-    if group is None or name != physical_id or new_pid != old_pid:
-        created = _cognito_user_pool_group_create(
-            logical_id or physical_id, new_props, stack_name
-        )
-        if group is not None:
-            _delete_predecessor(_cognito_user_pool_group_delete, physical_id, old_props)
-        return created
+    if group is None:
+        return _cognito_user_pool_group_create(logical_id or physical_id, new_props, stack_name)
 
     group["Description"] = new_props.get("Description", "")
     group["RoleArn"] = new_props.get("RoleArn", "")
@@ -6748,7 +6801,11 @@ def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_nam
     else:
         group.pop("Precedence", None)
     group["LastModifiedDate"] = _cognito._now_epoch()
-    return name, {}
+    return physical_id, {}
+
+
+def _cognito_user_pool_group_import(identifier):
+    return identifier["GroupName"], {}
 
 
 def _cognito_user_pool_group_delete(physical_id, props):
@@ -6791,8 +6848,11 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
     _cognito._identity_pools[iid] = pool
     # ListTagsForResource reads the pool's tag store, not the record.
     _cognito._identity_tags[iid] = _tag_map(props.get("IdentityPoolTags"))
-    # The one Fn::GetAtt the resource reference lists is Name.
-    return iid, {"Name": name}
+    return iid, _cognito_identity_pool_attributes(iid, name)
+
+
+def _cognito_identity_pool_attributes(iid, name):
+    return {"Id": iid, "Name": name}
 
 
 # UpdateIdentityPool's parameters, with the value a dropped property reverts
@@ -6831,7 +6891,12 @@ def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name,
         raise ValueError(f"AWS::Cognito::IdentityPool update failed: {body!r}")
     _reconcile_tag_map(_cognito._identity_tags.setdefault(physical_id, {}),
                        old_props, new_props, prop="IdentityPoolTags")
-    return physical_id, {"Name": name}
+    return physical_id, _cognito_identity_pool_attributes(physical_id, name)
+
+
+def _cognito_identity_pool_import(identifier):
+    iid = identifier["Id"]
+    return iid, _cognito_identity_pool_attributes(iid, _cognito._identity_pools[iid]["IdentityPoolName"])
 
 
 def _cognito_identity_pool_delete(physical_id, props):
@@ -6905,7 +6970,8 @@ def _ecr_repo_apply_policies(name, props):
 
 
 def _ecr_repo_create(logical_id, props, stack_name):
-    name = props.get("RepositoryName", f"{stack_name}-{logical_id}".lower())
+    name = props.get("RepositoryName") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=256)
     api = _ecr_cfn_to_api(props)
     if name in _ecr._repositories:
         # The create has always overwritten an existing record; refusing the
@@ -6981,9 +7047,9 @@ def _codebuild_project_delete(physical_id, props):
 # --- IAM ManagedPolicy provisioner ---
 
 def _iam_managed_policy_create(logical_id, props, stack_name):
-    name = props.get("ManagedPolicyName", f"{stack_name}-{logical_id}")
+    name = props.get("ManagedPolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:policy/{name}"
+    arn = f"arn:aws:iam::{get_account_id()}:policy{path}{name}"
     record = _iam.store_policy(arn, name, path, props.get("PolicyDocument", {}),
                                description=props.get("Description", ""))
     _attach_policy_to_entities(arn, props)
@@ -7011,28 +7077,9 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
     version at the five-version cap first, like the CFN handler), and the
     Roles / Users / Groups lists reconcile through attach/detach. The
     create-only properties (ManagedPolicyName, Path, Description) replace the
-    policy; under an unchanged custom name that replacement is refused, as
-    real CloudFormation refuses it."""
-    name = new_props.get("ManagedPolicyName", f"{stack_name}-{logical_id or physical_id}")
+    policy in ``_update_resource`` before this runs."""
     record = _iam._policies.get(physical_id)
-    replaced = _rename_replacement(
-        physical_id, old_props, new_props, stack_name, logical_id,
-        name, record.get("PolicyName") if record else None,
-        _iam_managed_policy_create, _iam_managed_policy_delete,
-    )
-    if replaced is not None:
-        return replaced
-
-    if (new_props.get("Path", "/") != old_props.get("Path", "/")
-            or new_props.get("Description", "") != old_props.get("Description", "")):
-        # Path and Description are create-only too, but the name didn't
-        # change, so the replacement cannot move to a new ARN.
-        if old_props.get("ManagedPolicyName"):
-            raise ValueError(
-                "CloudFormation cannot update a stack when a custom-named "
-                f"resource requires replacing. Rename {name} and update the "
-                "stack again."
-            )
+    if record is None:
         return _iam_managed_policy_create(logical_id or physical_id, new_props, stack_name)
 
     if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
@@ -7136,7 +7183,11 @@ def _kms_key_create(logical_id, props, stack_name):
         )
     rec = _kms._resolve_key(json.loads(body)["KeyMetadata"]["KeyId"])
     _kms_apply_key_props(rec, props)
-    return rec["KeyId"], {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
+    return rec["KeyId"], _kms_key_attrs(rec)
+
+
+def _kms_key_attrs(rec):
+    return {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
 
 
 def _kms_key_update(physical_id, old_props, new_props, stack_name):
@@ -7159,7 +7210,12 @@ def _kms_key_update(physical_id, old_props, new_props, stack_name):
         rec["Policy"] = policy if isinstance(policy, str) else json.dumps(policy)
     rec["Tags"] = _kms_tags(new_props)
     _kms_apply_key_props(rec, new_props)
-    return physical_id, {"Arn": rec["Arn"], "KeyId": rec["KeyId"]}
+    return physical_id, _kms_key_attrs(rec)
+
+
+def _kms_key_import(identifier):
+    rec = _kms._keys[identifier["KeyId"]]
+    return rec["KeyId"], _kms_key_attrs(rec)
 
 
 def _kms_key_delete(physical_id, props):
@@ -7225,6 +7281,10 @@ def _kms_alias_update(physical_id, old_props, new_props, stack_name, logical_id=
     _kms._aliases[_kms._alias_arn(physical_id)] = _kms_alias_target(target_key)
     _kms._stamp_alias(_kms._alias_arn(physical_id), created=False)
     return physical_id, {}
+
+
+def _kms_alias_import(identifier):
+    return identifier["AliasName"], {}
 
 
 def _kms_alias_delete(physical_id, props):
@@ -7856,6 +7916,30 @@ def _ecs_cluster_create(logical_id, props, stack_name):
     return name, {"Arn": cluster["clusterArn"], "ClusterName": name}
 
 
+def _ecs_cluster_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """ClusterName replaces; the rest updates in place (aws-resource-ecs-cluster)."""
+    name = new_props.get("ClusterName", f"{stack_name}-{logical_id or physical_id}")
+    cluster = _ecs._clusters.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, cluster["clusterName"] if cluster else None,
+        _ecs_cluster_create, _ecs_cluster_delete,
+    )
+    if replaced is not None:
+        return replaced
+    cluster["capacityProviders"] = new_props.get("CapacityProviders", [])
+    cluster["defaultCapacityProviderStrategy"] = _pascal_to_camel(
+        new_props.get("DefaultCapacityProviderStrategy") or [])
+    # Settings or configuration dropped from the template stay on the cluster.
+    if new_props.get("ClusterSettings"):
+        cluster["settings"] = _pascal_to_camel(new_props["ClusterSettings"])
+    if new_props.get("Configuration"):
+        cluster["configuration"] = _pascal_to_camel(new_props["Configuration"])
+    _reconcile_tag_list(_ecs._tags.setdefault(cluster["clusterArn"], []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"Arn": cluster["clusterArn"], "ClusterName": physical_id}
+
+
 def _ecs_cluster_delete(physical_id, props):
     _ecs._delete_cluster({"cluster": physical_id})
 
@@ -7891,7 +7975,7 @@ def _normalize_container_defs(cdefs):
 
 def _ecs_task_def_create(logical_id, props, stack_name):
     family = props.get("Family", f"{stack_name}-{logical_id}")
-    revision = 1
+    revision = _ecs._next_task_def_revision(family)
     td_key = f"{family}:{revision}"
     arn = f"arn:aws:ecs:{get_region()}:{get_account_id()}:task-definition/{td_key}"
     compat = props.get("RequiresCompatibilities", ["EC2"])
@@ -7917,14 +8001,22 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         if prop in props:
             td[key] = props[prop]
     _ecs._task_defs[td_key] = td
-    _ecs._task_def_latest[family] = revision
+    _ecs._tags[arn] = _pascal_to_camel(props.get("Tags") or [])
     return arn, {"TaskDefinitionArn": arn}
 
 
+def _ecs_task_def_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Tags update in place; any other change registers the next revision."""
+    if ({k: v for k, v in old_props.items() if k != "Tags"}
+            != {k: v for k, v in new_props.items() if k != "Tags"}):
+        return _ecs_task_def_create(logical_id or physical_id, new_props, stack_name)
+    _reconcile_tag_list(_ecs._tags.setdefault(physical_id, []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"TaskDefinitionArn": physical_id}
+
+
 def _ecs_task_def_delete(physical_id, props):
-    # physical_id is the ARN; _task_defs is keyed by "family:revision"
-    td_key = physical_id.split("/")[-1] if "/" in physical_id else physical_id
-    _ecs._task_defs.pop(td_key, None)
+    _ecs._deregister_task_definition({"taskDefinition": physical_id})
 
 
 def _ecs_deployment_configuration(props):
@@ -8197,13 +8289,8 @@ def _elbv2_load_balancer_update(physical_id, old_props, new_props, stack_name,
     ``LoadBalancerAttributes`` and ``Tags`` are "Update requires: No
     interruption" on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-loadbalancer.html);
-    ``Name``, ``Scheme`` and ``Type`` require replacement. A changed name
-    replaces through the shared prologue, and a ``Scheme`` or ``Type`` change
-    under a custom name is refused by ``_custom_named_replacement_error``,
-    which is what the reference states for this type: "If you specify a name,
-    you cannot perform updates that require replacement of this resource, but
-    you can perform other updates." Under a generated name there is nothing to
-    refuse and the replacement is performed here. ``SubnetMappings`` is No
+    ``Name``, ``Scheme`` and ``Type`` require replacement, which
+    ``_update_resource`` performs before this runs. ``SubnetMappings`` is No
     interruption as well and is modelled on neither path, here or in the
     create.
     """
@@ -8217,15 +8304,6 @@ def _elbv2_load_balancer_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-    if _requires_replacement("AWS::ElasticLoadBalancingV2::LoadBalancer",
-                             old_props, new_props):
-        # Scheme and Type replace. A generated name does not refuse that, and
-        # the new ARN carries a fresh id, so the predecessor is a resource of
-        # its own and an UpdateReplacePolicy of Retain can keep it.
-        created = _elbv2_load_balancer_create(
-            logical_id or physical_id, new_props, stack_name)
-        _delete_predecessor(_elbv2_load_balancer_delete, physical_id, old_props)
-        return created
 
     lb["IpAddressType"] = new_props.get("IpAddressType", "ipv4")
     lb["Subnets"] = _elbv2_as_list(new_props.get("Subnets"))
@@ -8373,7 +8451,9 @@ def _elbv2_listener_update(physical_id, old_props, new_props, stack_name,
 # ---------------------------------------------------------------------------
 
 def _lambda_layer_create(logical_id, props, stack_name):
-    layer_name = props.get("LayerName") or _physical_name(stack_name, logical_id, max_len=64)
+    # A replacement publishes the next version of the same layer.
+    layer_name = props.get("LayerName") or _physical_name(
+        stack_name, logical_id, max_len=64, seeded=False)
     runtimes = props.get("CompatibleRuntimes", [])
     architectures = props.get("CompatibleArchitectures", [])
 
@@ -8603,12 +8683,9 @@ def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
     its ARN (what Ref returns), its executions and its published versions.
     StateMachineName and StateMachineType require replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-stepfunctions-statemachine.html):
-    a rename creates the new machine before the old one is removed; a type
-    change under an unchanged name is refused — for a custom name by
-    _custom_named_replacement_error, as CloudFormation refuses it, and here
-    for a generated name, whose deterministic derivation cannot yield a
-    fresh identity. Definition, DefinitionSubstitutions, RoleArn,
-    LoggingConfiguration and Tags update without interruption;
+    ``_update_resource`` performs it before this runs. Definition,
+    DefinitionSubstitutions, RoleArn, LoggingConfiguration and Tags update
+    without interruption;
     TracingConfiguration and EncryptionConfiguration are accepted without
     effect, the store has no field for them.
     """
@@ -8623,15 +8700,6 @@ def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-
-    old_type = old_props.get("StateMachineType", "STANDARD")
-    new_type = new_props.get("StateMachineType", "STANDARD")
-    if new_type != old_type:
-        raise ValueError(
-            f"AWS::StepFunctions::StateMachine StateMachineType ({old_type} -> "
-            f"{new_type}) requires replacement, which MiniStack does not perform "
-            f"for {name}; set a StateMachineName to create the replacement."
-        )
 
     data = {
         "stateMachineArn": physical_id,
@@ -8873,13 +8941,9 @@ def _elbv2_target_group_update(physical_id, old_props, new_props, stack_name,
     No interruption" on the resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-targetgroup.html);
     ``Name``, ``Port``, ``Protocol``, ``ProtocolVersion``, ``TargetType``,
-    ``VpcId`` and ``IpAddressType`` require replacement. A changed name
-    replaces through the shared prologue; one of the others under an
-    unchanged custom name is refused by ``_custom_named_replacement_error``,
-    as CloudFormation refuses to replace a custom-named resource, and this
-    name "must be unique per region per account". Under a generated name the
-    replacement is performed here, and the registered targets go with the old
-    group.
+    ``VpcId`` and ``IpAddressType`` require replacement, which
+    ``_update_resource`` performs before this runs; the registered targets
+    go with the old group.
     """
     name = new_props.get("Name") or _physical_name(
         stack_name, logical_id or physical_id, max_len=32)
@@ -8891,15 +8955,6 @@ def _elbv2_target_group_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-    if _requires_replacement("AWS::ElasticLoadBalancingV2::TargetGroup",
-                             old_props, new_props):
-        # Port, Protocol, ProtocolVersion, TargetType, VpcId and IpAddressType
-        # replace; the targets registered in the old group stay with it, as on
-        # AWS, and its ARN carries a fresh id, so Retain can keep it.
-        created = _elbv2_target_group_create(
-            logical_id or physical_id, new_props, stack_name)
-        _delete_predecessor(_elbv2_target_group_delete, physical_id, old_props)
-        return created
 
     for prop, (field, default, cast) in _ELBV2_TG_HEALTH_CHECK.items():
         value = new_props.get(prop, default)
@@ -10137,10 +10192,8 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
     ``VisibilityConfig`` are "Update requires: No interruption" on the
     resource reference
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-wafv2-webacl.html);
-    ``Name`` and ``Scope`` require replacement. A changed name replaces
-    through the shared prologue; a ``Scope`` change under an unchanged
-    explicit name is refused by ``_custom_named_replacement_error``, and under
-    a generated name it is performed here. ``Tags`` are left alone on purpose:
+    ``Name`` and ``Scope`` require replacement, which ``_update_resource``
+    performs before this runs. ``Tags`` are left alone on purpose:
     the reference states that "With AWS CloudFormation, you can only add tags
     to AWS WAF resources during resource creation".
     """
@@ -10160,14 +10213,6 @@ def _waf_web_acl_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-    if _requires_replacement("AWS::WAFv2::WebACL", old_props, new_props):
-        # The create lands the ACL in the new scope's store, the delete
-        # removes the record from the one it was created in, and the new id
-        # is a fresh uuid, so Retain can keep the predecessor.
-        created = _waf_web_acl_create(
-            logical_id or physical_id, new_props, stack_name)
-        _delete_predecessor(_waf_web_acl_delete, physical_id, old_props)
-        return created
 
     _waf.update_web_acl_record(acl, new_props)
     return physical_id, {"Arn": acl["ARN"], "Id": acl_id}
@@ -10377,7 +10422,8 @@ def _rds_db_cluster_attrs(cluster):
 
 
 def _rds_db_cluster_create(logical_id, props, stack_name):
-    cluster_id = props.get("DBClusterIdentifier") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
+    cluster_id = props.get("DBClusterIdentifier") or _physical_name(
+        stack_name, logical_id, lowercase=True, max_len=63)
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster:{cluster_id}"
     suffix = new_uuid()[:8]
     created = now_iso()
@@ -10419,9 +10465,9 @@ def _rds_db_cluster_update(physical_id, old_props, new_props, stack_name, logica
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBCluster", old_props, new_props):
-        # The generated name is deterministic, so the replacement takes it back.
-        _rds_db_cluster_delete(physical_id, old_props)
-        return _rds_db_cluster_create(logical_id or physical_id, new_props, stack_name)
+        created = _seeded_create(_rds_db_cluster_create, logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_rds_db_cluster_delete, physical_id, old_props)
+        return created
     # A record saved before the create stored these fields gets them first, so the update cannot fail half-way.
     cluster.setdefault("DbClusterResourceId", _rds_cluster_resource_id())
     for key in ("EarliestRestorableTime", "LatestRestorableTime"):
@@ -10605,9 +10651,9 @@ def _rds_db_instance_update(physical_id, old_props, new_props, stack_name, logic
     if replaced is not None:
         return replaced
     if _requires_replacement("AWS::RDS::DBInstance", old_props, new_props):
-        # The generated name is deterministic, so the replacement takes it back.
-        _rds_db_instance_delete(physical_id, old_props)
-        return _rds_db_instance_create(logical_id or physical_id, new_props, stack_name)
+        created = _seeded_create(_rds_db_instance_create, logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_rds_db_instance_delete, physical_id, old_props)
+        return created
     _rds_apply_changed(instance, _rds_db_instance_fields(old_props), _rds_db_instance_fields(new_props))
     if _rds_db_instance_port(old_props) != _rds_db_instance_port(new_props):
         instance["Endpoint"]["Port"] = _rds_db_instance_port(new_props)
@@ -10747,9 +10793,9 @@ def _asg_delete(physical_id, props):
     _asg._delete_group_policies(physical_id)
 
 
-def _asg_lc_create(logical_id, props, stack_name, replacing=""):
+def _asg_lc_create(logical_id, props, stack_name):
     name = props.get("LaunchConfigurationName") or _physical_name(
-        stack_name, logical_id, max_len=255, replacing=replacing)
+        stack_name, logical_id, max_len=255)
     arn = f"arn:aws:autoscaling:{get_region()}:{get_account_id()}:launchConfiguration:{new_uuid()}:launchConfigurationName/{name}"
     _asg._launch_configs[name] = {
         "LaunchConfigurationName": name,
@@ -11320,12 +11366,7 @@ def _ec_parameter_group_create(logical_id, props, stack_name):
 
 
 def _ec_parameter_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
-    if (physical_id not in _ec._param_groups
-            or old_props.get("CacheParameterGroupFamily") != new_props.get("CacheParameterGroupFamily")):
-        # CacheParameterGroupFamily is the type's create-only property. The
-        # generated name does not change, so the old group goes first.
-        if physical_id in _ec._param_groups:
-            _ec_parameter_group_delete(physical_id, old_props)
+    if physical_id not in _ec._param_groups:
         return _ec_parameter_group_create(logical_id or physical_id, new_props, stack_name)
     old_values = {str(k): str(v) for k, v in (old_props.get("Properties") or {}).items()}
     new_values = {str(k): str(v) for k, v in (new_props.get("Properties") or {}).items()}
@@ -11992,12 +12033,6 @@ def _glue_trigger_update(physical_id, old_props, new_props, stack_name, logical_
         _glue_trigger_create, _glue_trigger_delete)
     if replaced:
         return replaced
-    if _requires_replacement("AWS::Glue::Trigger", old_props, new_props):
-        # Type and WorkflowName are create-only. An explicit Name is refused
-        # above the handler; a generated one is taken back by the replacement,
-        # so the old trigger goes first and there is nothing left to retain.
-        _glue_trigger_delete(physical_id, old_props)
-        return _glue_trigger_create(logical_id or physical_id, new_props, stack_name)
     trigger_update = {k: new_props[k] for k in ("Actions", *_GLUE_TRIGGER_DEFAULTS)
                       if k in new_props}
     trigger_update.update(_glue_reset_dropped(old_props, new_props, _GLUE_TRIGGER_DEFAULTS))
@@ -12029,9 +12064,16 @@ def _iot_thing_type_create(logical_id, props, stack_name):
         status, _headers, body = _iot._deprecate_thing_type(name, {"undoDeprecate": False})
         if status >= 400:
             raise ValueError(f"DeprecateThingType failed: {body}")
+    return name, _iot_thing_type_attrs(name)
+
+
+def _iot_thing_type_attrs(name):
     rec = _iot._thing_types.get(name) or {}
-    return name, {"Arn": rec.get("thingTypeArn", _iot._thing_type_arn(name)),
-                  "Id": rec.get("thingTypeId", "")}
+    return {"Arn": rec.get("thingTypeArn", _iot._thing_type_arn(name)), "Id": rec.get("thingTypeId", "")}
+
+
+def _iot_thing_type_import(identifier):
+    return identifier["ThingTypeName"], _iot_thing_type_attrs(identifier["ThingTypeName"])
 
 
 def _iot_thing_type_delete(physical_id, props):
@@ -12078,10 +12120,7 @@ def _iot_thing_type_update(physical_id, old_props, new_props, stack_name,
         status, _headers, body = _iot._deprecate_thing_type(physical_id, {"undoDeprecate": not deprecate})
         if status >= 400:
             raise ValueError(f"DeprecateThingType failed: {body}")
-    return physical_id, {
-        "Arn": record.get("thingTypeArn", _iot._thing_type_arn(physical_id)),
-        "Id": record.get("thingTypeId", ""),
-    }
+    return physical_id, _iot_thing_type_attrs(physical_id)
 
 
 # --- IoT ThingGroup ---
@@ -12123,23 +12162,12 @@ def _iot_thing_group_create(logical_id, props, stack_name):
 def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
     is the one property the reference marks No interruption that the service
-    stores. ThingGroupName and ParentGroupName require replacement
-    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iot-thinggroup.html):
-    the new group is created before the old one is removed, as CloudFormation
-    orders a replacement, and Ref follows the new id. QueryString and Tags are
-    accepted without effect — the service has no dynamic groups and no tag
-    store for thing groups. An auto-named group takes its deterministic name
-    back on a replacement, so the predecessor comes off first or
-    CreateThingGroup answers ResourceAlreadyExistsException; same shape as the
-    DynamoDB key-schema and Location tracker branches."""
+    stores. ThingGroupName and ParentGroupName changes are replaced in
+    ``_update_resource`` before this runs. QueryString and Tags are accepted
+    without effect — the service has no dynamic groups and no tag store for
+    thing groups."""
     rec = _iot_thing_group_record(physical_id)
-    replacement = rec is None or any(
-        new_props.get(key) != old_props.get(key)
-        for key in ("ThingGroupName", "ParentGroupName")
-    )
-    if replacement:
-        if rec is not None and not new_props.get("ThingGroupName"):
-            _iot_thing_group_delete(physical_id, old_props)
+    if rec is None:
         return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
     name = rec["thingGroupName"]
     resp = _iot._update_thing_group(
@@ -12220,6 +12248,11 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     return name, {"Arn": _iot._policy_arn(name), "Id": name}
 
 
+def _iot_policy_import(identifier):
+    name = identifier["Id"]
+    return name, {"Arn": _iot._policy_arn(name), "Id": name}
+
+
 def _iot_policy_delete(physical_id, props):
     _iot._policies.pop(physical_id, None)
 
@@ -12287,20 +12320,12 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     an UpdateProvisioningTemplate member (AWS stores it as a new version via
     CreateProvisioningTemplateVersion, which MiniStack does not model), so a
     changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement: under
-    an explicit name _custom_named_replacement_error refuses it as CloudFormation
-    does, and under a generated name the deterministic value is reused, so the
-    predecessor comes off first.
+    always stays at defaultVersionId 1. TemplateType requires replacement,
+    which ``_update_resource`` performs before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
     )
-    if (old_props.get("TemplateType", "FLEET_PROVISIONING")
-            != new_props.get("TemplateType", "FLEET_PROVISIONING")):
-        _iot_provisioning_template_delete(physical_id, old_props)
-        return _iot_provisioning_template_create(
-            logical_id or physical_id, new_props, stack_name
-        )
     if name != physical_id:
         created = _iot_provisioning_template_create(
             logical_id or physical_id, new_props, stack_name
@@ -12443,6 +12468,11 @@ def _iot_ca_certificate_update(physical_id, old_props, new_props, stack_name):
     return _iot_ca_certificate_apply(physical_id, new_props)
 
 
+def _iot_ca_certificate_import(identifier):
+    ca_id = identifier["Id"]
+    return ca_id, {"Arn": _iot._ca_cert_arn(ca_id), "Id": ca_id}
+
+
 def _iot_ca_certificate_delete(physical_id, props):
     if physical_id not in _iot._ca_certificates:
         return
@@ -12579,19 +12609,11 @@ def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
     return physical_id, {"Arn": stream["StreamARN"]}
 
 
-def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
+def _ecr_repo_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     repo = _ecr._repositories.get(physical_id)
-    new_name = new_props.get("RepositoryName")
-    if repo is None or (new_name and new_name != physical_id):
-        # A new name is a replacement: create the new repository, then delete
-        # the old one through DeleteRepository, unless the template retains it.
-        result = _ecr_repo_create(physical_id, new_props, stack_name)
-        if repo is not None:
-            _delete_predecessor(_ecr_repo_delete, physical_id, old_props)
-        return result
-    # ImageTagMutability, ImageScanningConfiguration, LifecyclePolicy,
-    # RepositoryPolicyText and Tags update in place; EncryptionConfiguration
-    # requires replacement and stays as it is.
+    if repo is None:
+        return _ecr_repo_create(logical_id or physical_id, new_props, stack_name)
+    # RepositoryName and EncryptionConfiguration are replaced in _update_resource.
     api = _ecr_cfn_to_api(new_props)
     repo["imageTagMutability"] = api["imageTagMutability"]
     repo["imageScanningConfiguration"] = api["imageScanningConfiguration"]
@@ -12740,12 +12762,7 @@ def _location_tracker_update(physical_id, old_props, new_props, stack_name,
     Tags change is reconciled on the record. TrackerName and KmsKeyId require
     replacement
     (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-location-tracker.html):
-    a renamed tracker is created before the old one, with its device
-    positions, is removed; a KmsKeyId change re-creates an auto-named
-    tracker under its deterministic physical name (the name is reused, so
-    the predecessor cannot be retained, as for a DynamoDB table), and with
-    an explicit, unchanged TrackerName it is refused by the
-    _CUSTOM_NAME_REPLACEMENT rule."""
+    ``_update_resource`` performs it before this runs."""
     import ministack.services.location as _location
     name = new_props.get("TrackerName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=100
@@ -12758,12 +12775,6 @@ def _location_tracker_update(physical_id, old_props, new_props, stack_name,
     )
     if replaced is not None:
         return replaced
-    if old_props.get("KmsKeyId") != new_props.get("KmsKeyId"):
-        # Not routed through _delete_predecessor, like the DynamoDB key-schema
-        # branch: the auto-generated name is deterministic, so the replacement
-        # takes it back and retaining the predecessor is not possible here.
-        _location_tracker_delete(physical_id, old_props)
-        return _location_tracker_create(logical_id or physical_id, new_props, stack_name)
     changes = {}
     for prop, default in _LOCATION_TRACKER_UPDATABLE.items():
         if prop in new_props:
@@ -12785,14 +12796,7 @@ def _location_tracker_delete(physical_id, props):
     _location._delete_tracker(physical_id)
 
 
-# CloudFormation reporting rules, checked against DescribeType and change sets.
-# A row lists the schema's createOnlyProperties (Always); the conditional table
-# below lists its conditionalCreateOnlyProperties (Conditionally). Any other
-# property of a listed type is in place (Never), as AWS reports it. Service API
-# immutability is different: an update may fail without being reported as a
-# replacement (for example Cognito sign-in attributes). Keep the execution
-# predicates separate until their behavior has been reconciled. Types without
-# a row keep the conservative Conditionally answer.
+# Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::DynamoDB::Table": ("TableName", "ImportSourceSpecification"),
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
@@ -12812,6 +12816,9 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "SecurityGroups", "SpotPrice", "UserData",
     ),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
+    "AWS::IAM::Role": ("RoleName", "Path"),
+    "AWS::IAM::ManagedPolicy": ("ManagedPolicyName", "Description", "Path"),
+    "AWS::ECR::Repository": ("RepositoryName", "EncryptionConfiguration"),
     "AWS::IoT::ProvisioningTemplate": ("TemplateName", "TemplateType"),
     "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Name", "Scheme", "Type"),
     "AWS::ElasticLoadBalancingV2::TargetGroup": (
@@ -12878,6 +12885,13 @@ def _property_recreation(resource_type: str, name: str) -> str:
     return "Never"
 
 
+def _replacing_change(resource_type, old_props, new_props) -> bool:
+    """Whether a changed property is one DescribeChangeSet reports as Always."""
+    return any(_property_recreation(resource_type, name) == "Always"
+               for name in old_props.keys() | new_props.keys()
+               if old_props.get(name) != new_props.get(name))
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -12885,11 +12899,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _opensearch_domain_delete,
     },
-    "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
+    "AWS::S3::Bucket": {
+        "create": _s3_create, "update": _s3_update, "delete": _s3_delete, "import": _s3_import,
+    },
     "AWS::S3::MultiRegionAccessPoint": {
         "create": _s3_mrap_create,
-        "update": _replacing_update(_s3_mrap_create, _s3_mrap_delete),
-        "update_with_logical_id": True,
         "delete": _s3_mrap_delete,
     },
     "AWS::S3::BucketPolicy": {
@@ -12992,12 +13006,14 @@ _RESOURCE_HANDLERS = {
         "update": _sqs_update,
         "update_with_logical_id": True,
         "delete": _sqs_delete,
+        "import": _sqs_import,
     },
     "AWS::SNS::Topic": {
         "create": _sns_create,
         "update": _sns_update,
         "update_with_logical_id": True,
         "delete": _sns_delete,
+        "import": _sns_import,
     },
     "AWS::SNS::Subscription": {
         "create": _sns_sub_create,
@@ -13010,6 +13026,7 @@ _RESOURCE_HANDLERS = {
         "update": _ddb_update,
         "update_with_logical_id": True,
         "delete": _ddb_delete,
+        "import": _ddb_import,
     },
     # CDK TableV2 emits AWS::DynamoDB::GlobalTable, even for single-region
     # tables. The schema differs from Table (no ProvisionedThroughput; capacity
@@ -13022,6 +13039,7 @@ _RESOURCE_HANDLERS = {
         "update": _lambda_update,
         "update_with_logical_id": True,
         "delete": _lambda_delete,
+        "import": _lambda_import,
     },
     "AWS::Lambda::Url": {
         "create": _lambda_url_create,
@@ -13033,6 +13051,7 @@ _RESOURCE_HANDLERS = {
         "update": _iam_role_update,
         "update_with_logical_id": True,
         "delete": _iam_role_delete,
+        "import": _iam_role_import,
     },
     "AWS::IAM::Policy": {
         "create": _iam_policy_create,
@@ -13046,7 +13065,9 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_ip_delete,
     },
-    "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
+    "AWS::SSM::Parameter": {
+        "create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete, "import": _ssm_import,
+    },
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
         "update": _appconfig_application_update,
@@ -13085,6 +13106,7 @@ _RESOURCE_HANDLERS = {
         "update": _cwlogs_update,
         "update_with_logical_id": True,
         "delete": _cwlogs_delete,
+        "import": _cwlogs_import,
     },
     "AWS::Logs::ResourcePolicy": {
         "create": _cwlogs_resource_policy_create,
@@ -13140,6 +13162,7 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_rest_api_update,
         "update_with_logical_id": True,
         "delete": _apigw_rest_api_delete,
+        "import": _apigw_rest_api_import,
     },
     "AWS::ApiGateway::Resource": {
         "create": _apigw_resource_create,
@@ -13171,6 +13194,7 @@ _RESOURCE_HANDLERS = {
         "create": _apigw_stage_create,
         "update": _apigw_stage_update,
         "delete": _apigw_stage_delete,
+        "import": _apigw_stage_import,
     },
     "AWS::ApiGateway::ApiKey": {
         "create": _apigw_api_key_create,
@@ -13281,33 +13305,43 @@ _RESOURCE_HANDLERS = {
         "update": _cognito_user_pool_update,
         "update_with_logical_id": True,
         "delete": _cognito_user_pool_delete,
+        "import": _cognito_user_pool_import,
     },
     "AWS::Cognito::UserPoolClient": {
         "create": _cognito_user_pool_client_create,
         "update": _cognito_user_pool_client_update,
         "update_with_logical_id": True,
         "delete": _cognito_user_pool_client_delete,
+        "import": _cognito_user_pool_client_import,
     },
     "AWS::Cognito::UserPoolResourceServer": {
         "create": _cognito_user_pool_resource_server_create,
         "update": _cognito_user_pool_resource_server_update,
         "update_with_logical_id": True,
         "delete": _cognito_user_pool_resource_server_delete,
+        "import": _cognito_user_pool_resource_server_import,
     },
     "AWS::Cognito::UserPoolGroup": {
         "create": _cognito_user_pool_group_create,
         "update": _cognito_user_pool_group_update,
         "update_with_logical_id": True,
         "delete": _cognito_user_pool_group_delete,
+        "import": _cognito_user_pool_group_import,
     },
     "AWS::Cognito::IdentityPool": {
         "create": _cognito_identity_pool_create,
         "update": _cognito_identity_pool_update,
         "update_with_logical_id": True,
         "delete": _cognito_identity_pool_delete,
+        "import": _cognito_identity_pool_import,
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
-    "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
+    "AWS::ECR::Repository": {
+        "create": _ecr_repo_create,
+        "update": _ecr_repo_update,
+        "update_with_logical_id": True,
+        "delete": _ecr_repo_delete,
+    },
     "AWS::CertificateManager::Certificate": {
         "create": _acm_certificate_create,
         "update": _acm_certificate_update,
@@ -13337,12 +13371,14 @@ _RESOURCE_HANDLERS = {
         "create": _kms_key_create,
         "update": _kms_key_update,
         "delete": _kms_key_delete,
+        "import": _kms_key_import,
     },
     "AWS::KMS::Alias": {
         "create": _kms_alias_create,
         "update": _kms_alias_update,
         "update_with_logical_id": True,
         "delete": _kms_alias_delete,
+        "import": _kms_alias_import,
     },
     "AWS::EC2::VPC": {
         "create": _ec2_vpc_create,
@@ -13392,8 +13428,18 @@ _RESOURCE_HANDLERS = {
         "delete": _ec2_route_delete,
     },
     "AWS::EC2::SubnetRouteTableAssociation": {"create": _ec2_subnet_rtb_assoc_create, "delete": _ec2_subnet_rtb_assoc_delete},
-    "AWS::ECS::Cluster": {"create": _ecs_cluster_create, "delete": _ecs_cluster_delete},
-    "AWS::ECS::TaskDefinition": {"create": _ecs_task_def_create, "delete": _ecs_task_def_delete},
+    "AWS::ECS::Cluster": {
+        "create": _ecs_cluster_create,
+        "update": _ecs_cluster_update,
+        "update_with_logical_id": True,
+        "delete": _ecs_cluster_delete,
+    },
+    "AWS::ECS::TaskDefinition": {
+        "create": _ecs_task_def_create,
+        "update": _ecs_task_def_update,
+        "update_with_logical_id": True,
+        "delete": _ecs_task_def_delete,
+    },
     "AWS::ECS::Service": {
         "create": _ecs_service_create,
         "update": _ecs_service_update,
@@ -13574,6 +13620,7 @@ _RESOURCE_HANDLERS = {
         "update": _iot_thing_type_update,
         "update_with_logical_id": True,
         "delete": _iot_thing_type_delete,
+        "import": _iot_thing_type_import,
     },
     "AWS::IoT::ThingGroup": {
         "create": _iot_thing_group_create,
@@ -13586,6 +13633,7 @@ _RESOURCE_HANDLERS = {
         "update": _iot_policy_update,
         "update_with_logical_id": True,
         "delete": _iot_policy_delete,
+        "import": _iot_policy_import,
     },
     "AWS::IoT::ProvisioningTemplate": {
         "create": _iot_provisioning_template_create,
@@ -13597,6 +13645,7 @@ _RESOURCE_HANDLERS = {
         "create": _iot_ca_certificate_create,
         "update": _iot_ca_certificate_update,
         "delete": _iot_ca_certificate_delete,
+        "import": _iot_ca_certificate_import,
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
@@ -13660,8 +13709,6 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::AutoScaling::LaunchConfiguration": {
         "create": _asg_lc_create,
-        "update": _replacing_update(_asg_lc_create, _asg_lc_delete),
-        "update_with_logical_id": True,
         "delete": _asg_lc_delete,
     },
     "AWS::AutoScaling::ScalingPolicy": {
