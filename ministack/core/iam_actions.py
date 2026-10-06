@@ -1710,6 +1710,8 @@ def dynamodb_transaction_checks(
 
     ``TransactWriteItems`` and ``TransactGetItems`` are not IAM actions: each
     item is authorized as the single-item action it performs, on its own table.
+    An item naming more than one member (AWS rejects it, the handler does not)
+    is checked for every member, so none can ride along unchecked.
     Returns an empty list for any other action or a body with no usable item.
     """
     if iam_action not in ("dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"):
@@ -1728,7 +1730,6 @@ def dynamodb_transaction_checks(
             table = detail.get("TableName") if isinstance(detail, dict) else None
             if isinstance(table, str) and table:
                 checks.append((action, f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"))
-                break
     return checks
 
 

@@ -2598,14 +2598,14 @@ class TestDynamoDBTransactionAuthorization:
     _TABLE = "arn:aws:dynamodb:us-east-1:000000000000:table/repro"
 
     @staticmethod
-    def _transact(monkeypatch, target, items_key, items, actions):
+    def _transact(monkeypatch, target, items_key, items, actions, resource="*"):
         import asyncio
 
         import ministack.app as app_mod
         from ministack.core import iam_evaluator
 
         statements = parse_policy_document({"Statement": [{
-            "Effect": "Allow", "Action": actions, "Resource": "*",
+            "Effect": "Allow", "Action": actions, "Resource": resource,
         }]})
         seen = []
         handled = []
@@ -2664,7 +2664,7 @@ class TestDynamoDBTransactionAuthorization:
             monkeypatch, "TransactWriteItems", "TransactItems", self._WRITE,
             ["dynamodb:TransactWriteItems", "dynamodb:PutItem"],
         )
-        assert response[0] in (400, 403)
+        assert response[0] == 403
         assert b"AccessDenied" in response[2]
         assert b"dynamodb:ConditionCheckItem" in response[2]
         assert not handled
@@ -2680,6 +2680,35 @@ class TestDynamoDBTransactionAuthorization:
         )
         assert response[0] == 200
         assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+
+    def test_item_naming_several_members_is_checked_for_each(self, monkeypatch):
+        # AWS rejects an item with two members; the handler does not, so the
+        # second member must not run unchecked behind an allowed first one.
+        items = [{
+            "Update": {"TableName": "repro", "Key": {"pk": {"S": "a"}}, "UpdateExpression": "SET x = :x"},
+            "Delete": {"TableName": "repro", "Key": {"pk": {"S": "a"}}},
+        }]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:UpdateItem"],
+        )
+        assert [a for a, _ in seen] == ["dynamodb:UpdateItem", "dynamodb:DeleteItem"]
+        assert response[0] == 403
+        assert b"dynamodb:DeleteItem" in response[2]
+        assert not handled
+
+    def test_denial_on_a_later_table_refuses_the_whole_transaction(self, monkeypatch):
+        items = [
+            {"Put": {"TableName": "repro", "Item": {"pk": {"S": "a"}}}},
+            {"Put": {"TableName": "other", "Item": {"pk": {"S": "b"}}}},
+        ]
+        response, seen, handled = self._transact(
+            monkeypatch, "TransactWriteItems", "TransactItems", items, ["dynamodb:PutItem"],
+            resource=self._TABLE,
+        )
+        assert [r for _, r in seen] == [self._TABLE, self._TABLE.replace("repro", "other")]
+        assert response[0] == 403
+        assert b"AccessDenied" in response[2]
+        assert not handled
 
     def test_get_is_authorised_per_item_on_its_own_table(self, monkeypatch):
         items = [
@@ -2701,6 +2730,7 @@ class TestDynamoDBTransactionAuthorization:
             monkeypatch, "TransactGetItems", "TransactItems", items,
             ["dynamodb:TransactGetItems"],
         )
+        assert response[0] == 403
         assert b"AccessDenied" in response[2]
         assert b"dynamodb:GetItem" in response[2]
         assert not handled

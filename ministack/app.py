@@ -2519,12 +2519,13 @@ async def _dispatch_service_request(
             )
             if transaction_checks:
                 denied = None
-                for iam_action, resource_arn in transaction_checks:
+                for item_action, item_arn in transaction_checks:
                     denied = enforce(
-                        access_key, iam_action, service, region,
-                        resource_arn=resource_arn, service_context=service_context,
+                        access_key, item_action, service, region,
+                        resource_arn=item_arn, service_context=service_context,
                     )
                     if denied:
+                        iam_action = item_action  # named in the AccessDenied message
                         break
             else:
                 denied = enforce(
